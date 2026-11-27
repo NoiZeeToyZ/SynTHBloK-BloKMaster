@@ -18,6 +18,10 @@
 #include <cmath>
 #include <algorithm>
 #include <atomic>
+#include <vector>
+#include <string>
+#include <cstdio>
+#include <cstdlib>
 
 namespace {
 
@@ -358,10 +362,44 @@ struct BlokMaster : Module {
         monoHp.highpass(params[MONO_BASS_PARAM].getValue(), 0.70710678f, sr);
     }
 
+    // MASTER DUMP (Nov 12 2026, dev test hook, off unless the environment asks): SYNTHBLOK_MASTER_DUMP=<path> writes
+    // <path>.<module id>.wav (48 kHz-ish 16-bit stereo, +-10 V = full scale) of the OUTPUT: SYNTHBLOK_MASTER_DUMP_SEC
+    // seconds (default 45), starting SYNTHBLOK_MASTER_DUMP_SKIP seconds (default 25) after the first sound, so a RANDROYD
+    // track can be measured as the real build plays it (tools/genre_compare.py).
+    struct Dump { std::string path; std::vector<int16_t> buf; long skip = 0, len = 0; bool on = false, heard = false, done = false; int sr = 48000; } dump;
+    void dumpStep(float l, float r, float sampleRate) {
+        if (!dump.on || dump.done) return;
+        if (!dump.heard) { if (std::fabs(l) + std::fabs(r) < 1e-3f) return; dump.heard = true; dump.sr = (int) sampleRate; }
+        if (dump.skip > 0) { dump.skip--; return; }
+        auto q = [](float v) { return (int16_t) std::max(-32767.f, std::min(32767.f, v / 10.f * 32767.f)); };
+        dump.buf.push_back(q(l)); dump.buf.push_back(q(r));
+        if ((long) dump.buf.size() / 2 < dump.len) return;
+        dump.done = true;
+        std::string fn = dump.path + "." + std::to_string(id) + ".wav";
+        if (FILE* f = std::fopen(fn.c_str(), "wb")) {
+            uint32_t n = (uint32_t) dump.buf.size() * 2;
+            auto u32 = [&](uint32_t v) { std::fwrite(&v, 4, 1, f); };
+            auto u16 = [&](uint16_t v) { std::fwrite(&v, 2, 1, f); };
+            std::fwrite("RIFF", 1, 4, f); u32(36 + n); std::fwrite("WAVEfmt ", 1, 8, f); u32(16); u16(1); u16(2);
+            u32((uint32_t) dump.sr); u32((uint32_t) dump.sr * 4); u16(4); u16(16); std::fwrite("data", 1, 4, f); u32(n);
+            std::fwrite(dump.buf.data(), 2, dump.buf.size(), f);
+            std::fclose(f);
+        }
+        dump.buf.clear(); dump.buf.shrink_to_fit();
+    }
+
     // ------------------------------------------------------------------
     // main audio callback
     // ------------------------------------------------------------------
     void process(const ProcessArgs& args) override {
+        if (!dump.on && !dump.done && dump.path.empty()) {
+            if (const char* d = getenv("SYNTHBLOK_MASTER_DUMP")) {
+                dump.path = d; dump.on = true;
+                const char* sk = getenv("SYNTHBLOK_MASTER_DUMP_SKIP"); const char* se = getenv("SYNTHBLOK_MASTER_DUMP_SEC");
+                dump.skip = (long) ((sk ? atof(sk) : 25.0) * args.sampleRate);
+                dump.len = (long) ((se ? atof(se) : 45.0) * args.sampleRate);
+            } else dump.path = "-";   // checked once
+        }
         if (++ctrlCount >= 32) {
             ctrlCount = 0; updateControlRate();
             for (int i = 0; i < NUM_VIEWS; i++)
@@ -561,6 +599,7 @@ struct BlokMaster : Module {
         float oL = l * (1.f - byp) + inL * byp, oR = r * (1.f - byp) + inR * byp;
         outputs[OUT_L_OUTPUT].setVoltage(oL);
         outputs[OUT_R_OUTPUT].setVoltage(oR);
+        if (dump.on) dumpStep(oL, oR, args.sampleRate);
 
         // ---------------- metering ----------------
         float pkOut = std::max(std::fabs(oL), std::fabs(oR));
